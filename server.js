@@ -6,7 +6,7 @@ const cors = require('cors');
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 // ==================== DATABASE ====================
 
@@ -92,13 +92,40 @@ function isValidImageUrl(value) {
     }
 }
 
-function validOptionalImage(value) {
-    if (value === undefined || value === null || value === '') {
-        return true;
+function isValidImage(value) {
+    if (typeof value !== "string" || !value.trim()) {
+        return false;
     }
 
-    return isValidImageUrl(value);
+    const image = value.trim();
+
+    // Base64 image support
+    const base64Match = image.match(
+        /^data:image\/(jpeg|jpg|png|webp|gif);base64,([A-Za-z0-9+/]*={0,2})$/
+    );
+
+    if (base64Match) {
+        const base64 = base64Match[2];
+
+        return (
+            base64.length > 0 &&
+            base64.length % 4 === 0
+        );
+    }
+
+    // Normal HTTP/HTTPS image URL support
+    try {
+        const url = new URL(image);
+
+        return (
+            url.protocol === "http:" ||
+            url.protocol === "https:"
+        );
+    } catch {
+        return false;
+    }
 }
+
 
 // ==================== 1. CREATE GROUP ====================
 
@@ -143,12 +170,15 @@ app.post('/api/groups', async (req, res) => {
             });
         }
 
-        if (!validOptionalImage(avatar) || !validOptionalImage(cover_photo)) {
-            return res.status(400).json({
-                error: 'Avatar and cover photo must be valid image URLs.'
-            });
-        }
 
+if (
+    !isValidImage(avatar) ||
+    !isValidImage(cover_photo)
+) {
+    return res.status(400).json({
+        error: "Avatar and cover photo must be valid image URLs or supported Base64 images."
+    });
+}
         const admins = [adminEmail];
         const members = [adminEmail];
 
@@ -178,7 +208,7 @@ app.post('/api/groups', async (req, res) => {
             JSON.stringify(members),
             purpus || '',
             short_discription || '',
-            type || 'General Discussion',
+            type || 'Other',
             avatar || null,
             cover_photo || null
         ];
