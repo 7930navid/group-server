@@ -689,6 +689,145 @@ app.delete('/api/groups/:id', async (req, res) => {
     }
 });
 
+
+
+ // =====================================================
+ // PROMOTE GROUP MEMBER TO ADMIN
+ // =====================================================
+
+app.post('/api/groups/:id/promote-admin', async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+        const groupId = req.params.id;
+
+        const { email, promote_email } = req.body;
+
+        const requesterEmail = normalizeEmail(email);
+        const promoteEmail = normalizeEmail(promote_email);
+
+        if (!requesterEmail || !promoteEmail) {
+            return res.status(400).json({
+                success: false,
+                message: 'Requester email and promote email are required.'
+            });
+        }
+
+        if (requesterEmail === promoteEmail) {
+            return res.status(400).json({
+                success: false,
+                message: 'You cannot promote yourself.'
+            });
+        }
+
+        await client.query('BEGIN');
+
+        // Get group and lock row
+        const groupResult = await client.query(
+            `SELECT * FROM groups
+             WHERE id = $1
+             FOR UPDATE`,
+            [groupId]
+        );
+
+        if (!groupResult.rows.length) {
+            await client.query('ROLLBACK');
+
+            return res.status(404).json({
+                success: false,
+                message: 'Group not found.'
+            });
+        }
+
+        const group = groupResult.rows[0];
+
+        const admins = Array.isArray(group.admin_email)
+            ? group.admin_email.map(normalizeEmail)
+            : [];
+
+        const members = Array.isArray(group.members_email)
+            ? group.members_email.map(normalizeEmail)
+            : [];
+
+        // Verify requester is admin
+        if (!admins.includes(requesterEmail)) {
+            await client.query('ROLLBACK');
+
+            return res.status(403).json({
+                success: false,
+                message: 'Only group admins can promote members.'
+            });
+        }
+
+        // Verify target is a group member
+        if (!members.includes(promoteEmail)) {
+            await client.query('ROLLBACK');
+
+            return res.status(400).json({
+                success: false,
+                message: 'This user is not a member of this group.'
+            });
+        }
+
+        // Already an admin?
+        if (admins.includes(promoteEmail)) {
+            await client.query('ROLLBACK');
+
+            return res.status(409).json({
+                success: false,
+                message: 'This member is already an admin.'
+            });
+        }
+
+        // Promote member
+        const updatedAdmins = [
+            ...admins,
+            promoteEmail
+        ];
+
+        // Remove promoted member from members list
+        const updatedMembers = members.filter(
+            member => member !== promoteEmail
+        );
+
+        const updateResult = await client.query(
+            `UPDATE groups
+             SET admin_email = $1,
+                 members_email = $2
+             WHERE id = $3
+             RETURNING *`,
+            [
+                updatedAdmins,
+                updatedMembers,
+                groupId
+            ]
+        );
+
+        await client.query('COMMIT');
+
+        return res.status(200).json({
+            success: true,
+            message: 'Member successfully promoted to admin.',
+            group: updateResult.rows[0]
+        });
+
+    } catch (error) {
+
+        await client.query('ROLLBACK');
+
+        console.error('Promote admin error:', error);
+
+        return res.status(500).json({
+            success: false,
+            message: 'Internal server error.'
+        });
+
+    } finally {
+        client.release();
+    }
+});
+
+
 // ==================== START SERVER ====================
 
 const PORT = process.env.PORT || 5000;
