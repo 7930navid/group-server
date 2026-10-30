@@ -1,4 +1,3 @@
-
 const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
@@ -20,35 +19,31 @@ const pool = new Pool({
 // ==================== DATABASE SETUP ====================
 
 async function setupDatabase() {
-    try {
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS groups (
-                id VARCHAR(100) UNIQUE NOT NULL,
-                groupname VARCHAR(255) NOT NULL,
-                password VARCHAR(255),
-                admin_email JSONB DEFAULT '[]'::jsonb,
-                members_email JSONB DEFAULT '[]'::jsonb,
-                purpus TEXT,
-                short_discription TEXT,
-                type VARCHAR(100) DEFAULT 'General Discussion',
-                avatar TEXT,
-                cover_photo TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS groups (
+            id VARCHAR(100) UNIQUE NOT NULL,
+            groupname VARCHAR(255) NOT NULL,
+            password VARCHAR(255),
+            admin_email JSONB DEFAULT '[]'::jsonb,
+            members_email JSONB DEFAULT '[]'::jsonb,
+            purpus TEXT,
+            short_discription TEXT,
+            type VARCHAR(100) DEFAULT 'General Discussion',
+            avatar TEXT,
+            cover_photo TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    `);
 
-        // Existing database compatibility
-        await pool.query(`
-            ALTER TABLE groups
-                ADD COLUMN IF NOT EXISTS avatar TEXT,
-                ADD COLUMN IF NOT EXISTS cover_photo TEXT;
-        `);
+    await pool.query(`
+        ALTER TABLE groups
+            ADD COLUMN IF NOT EXISTS avatar TEXT,
+            ADD COLUMN IF NOT EXISTS cover_photo TEXT,
+            ADD COLUMN IF NOT EXISTS admin_email JSONB DEFAULT '[]'::jsonb,
+            ADD COLUMN IF NOT EXISTS members_email JSONB DEFAULT '[]'::jsonb;
+    `);
 
-        console.log('Groups database setup completed.');
-    } catch (error) {
-        console.error('Database setup error:', error);
-        process.exit(1);
-    }
+    console.log('Groups database setup completed.');
 }
 
 // ==================== HELPERS ====================
@@ -61,26 +56,46 @@ function normalizeEmail(email) {
 
 function parseEmailList(value) {
     if (Array.isArray(value)) {
-        return value
-            .filter(item => typeof item === 'string')
-            .map(item => item.trim().toLowerCase())
-            .filter(Boolean);
+        return [...new Set(
+            value
+                .filter(item => typeof item === 'string')
+                .map(item => normalizeEmail(item))
+                .filter(Boolean)
+        )];
     }
 
     if (typeof value === 'string' && value.trim()) {
-        return [value.trim().toLowerCase()];
+        const text = value.trim();
+
+        // JSON string array support
+        try {
+            const parsed = JSON.parse(text);
+
+            if (Array.isArray(parsed)) {
+                return parseEmailList(parsed);
+            }
+        } catch {
+            // Treat as a single email or comma-separated list
+        }
+
+        return [...new Set(
+            text.split(',')
+                .map(item => normalizeEmail(item))
+                .filter(Boolean)
+        )];
     }
 
     return [];
 }
 
+// Validate HTTP / HTTPS image URLs
 function isValidImageUrl(value) {
     if (typeof value !== 'string' || !value.trim()) {
         return false;
     }
 
     try {
-        const url = new URL(value);
+        const url = new URL(value.trim());
 
         return (
             ['https:', 'http:'].includes(url.protocol) &&
@@ -92,16 +107,16 @@ function isValidImageUrl(value) {
     }
 }
 
+// Validate Base64 and normal image URLs
 function isValidImage(value) {
-    if (typeof value !== "string" || !value.trim()) {
+    if (typeof value !== 'string' || !value.trim()) {
         return false;
     }
 
     const image = value.trim();
 
-    // Base64 image support
     const base64Match = image.match(
-        /^data:image\/(jpeg|jpg|png|webp|gif);base64,([A-Za-z0-9+/]*={0,2})$/
+        /^data:image\/(jpeg|jpg|png|webp|gif);base64,([A-Za-z0-9+/]*={0,2})$/i
     );
 
     if (base64Match) {
@@ -113,19 +128,27 @@ function isValidImage(value) {
         );
     }
 
-    // Normal HTTP/HTTPS image URL support
-    try {
-        const url = new URL(image);
-
-        return (
-            url.protocol === "http:" ||
-            url.protocol === "https:"
-        );
-    } catch {
-        return false;
-    }
+    return isValidImageUrl(image);
 }
 
+// IMPORTANT:
+// undefined, null and empty string are allowed.
+// This lets the update route preserve or clear existing images.
+function validOptionalImage(value) {
+    if (value === undefined || value === null || value === '') {
+        return true;
+    }
+
+    return isValidImage(value);
+}
+
+function getGroupAdmins(group) {
+    return parseEmailList(group.admin_email);
+}
+
+function getGroupMembers(group) {
+    return parseEmailList(group.members_email);
+}
 
 // ==================== 1. CREATE GROUP ====================
 
@@ -158,7 +181,7 @@ app.post('/api/groups', async (req, res) => {
         const name = groupname.trim();
         const adminEmail = normalizeEmail(admin_email);
 
-        if (!adminEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(adminEmail)) {
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(adminEmail)) {
             return res.status(400).json({
                 error: 'A valid admin email is required.'
             });
@@ -170,19 +193,19 @@ app.post('/api/groups', async (req, res) => {
             });
         }
 
+        if (
+            !validOptionalImage(avatar) ||
+            !validOptionalImage(cover_photo)
+        ) {
+            return res.status(400).json({
+                error: 'Avatar and cover photo must be valid image URLs or supported Base64 images.'
+            });
+        }
 
-if (
-    !isValidImage(avatar) ||
-    !isValidImage(cover_photo)
-) {
-    return res.status(400).json({
-        error: "Avatar and cover photo must be valid image URLs or supported Base64 images."
-    });
-}
         const admins = [adminEmail];
         const members = [adminEmail];
 
-        const query = `
+        const result = await pool.query(`
             INSERT INTO groups (
                 id,
                 groupname,
@@ -199,21 +222,17 @@ if (
                 $5, $6, $7, $8, $9
             )
             RETURNING *;
-        `;
-
-        const values = [
+        `, [
             groupId,
             name,
             JSON.stringify(admins),
             JSON.stringify(members),
             purpus || '',
             short_discription || '',
-            type || 'Other',
+            type || 'General Discussion',
             avatar || null,
             cover_photo || null
-        ];
-
-        const result = await pool.query(query, values);
+        ]);
 
         return res.status(201).json({
             message: 'Group created successfully!',
@@ -221,7 +240,7 @@ if (
         });
 
     } catch (error) {
-        console.error('Create group error:', error.message);
+        console.error('Create group error:', error);
 
         if (error.code === '23505') {
             return res.status(409).json({
@@ -246,8 +265,9 @@ app.get('/api/groups', async (req, res) => {
         `);
 
         return res.json(result.rows);
+
     } catch (error) {
-        console.error('Fetch groups error:', error.message);
+        console.error('Fetch groups error:', error);
 
         return res.status(500).json({
             error: 'Server error while fetching groups.'
@@ -269,8 +289,6 @@ app.get('/api/groups/search', async (req, res) => {
             });
         }
 
-        const searchTerm = `%${q}%`;
-
         const result = await pool.query(`
             SELECT *
             FROM groups
@@ -279,11 +297,12 @@ app.get('/api/groups/search', async (req, res) => {
                OR short_discription ILIKE $1
                OR type ILIKE $1
             ORDER BY created_at DESC;
-        `, [searchTerm]);
+        `, [`%${q}%`]);
 
         return res.json(result.rows);
+
     } catch (error) {
-        console.error('Search groups error:', error.message);
+        console.error('Search groups error:', error);
 
         return res.status(500).json({
             error: 'Server error while searching groups.'
@@ -307,8 +326,9 @@ app.get('/api/groups/:id', async (req, res) => {
         }
 
         return res.json(result.rows[0]);
+
     } catch (error) {
-        console.error('Get group error:', error.message);
+        console.error('Get group error:', error);
 
         return res.status(500).json({
             error: 'Server error while fetching group.'
@@ -316,12 +336,15 @@ app.get('/api/groups/:id', async (req, res) => {
     }
 });
 
-// ==================== 5. UPDATE GROUP / PROMOTE ADMIN ====================
+// ==================== 5. UPDATE GROUP ====================
 
 app.put('/api/groups/:id', async (req, res) => {
-    const client = await pool.connect();
+    let client;
+    let transactionStarted = false;
 
     try {
+        client = await pool.connect();
+
         const {
             email,
             groupname,
@@ -329,8 +352,7 @@ app.put('/api/groups/:id', async (req, res) => {
             short_discription,
             type,
             avatar,
-            cover_photo,
-            promote_email
+            cover_photo
         } = req.body;
 
         const requesterEmail = normalizeEmail(email);
@@ -341,16 +363,18 @@ app.put('/api/groups/:id', async (req, res) => {
             });
         }
 
+        // Validate images only if supplied
         if (
             !validOptionalImage(avatar) ||
             !validOptionalImage(cover_photo)
         ) {
             return res.status(400).json({
-                error: 'Avatar and cover photo must be valid image URLs.'
+                error: 'Avatar and cover photo must be valid image URLs or supported Base64 images.'
             });
         }
 
         await client.query('BEGIN');
+        transactionStarted = true;
 
         const groupResult = await client.query(
             'SELECT * FROM groups WHERE id = $1 FOR UPDATE',
@@ -359,6 +383,7 @@ app.put('/api/groups/:id', async (req, res) => {
 
         if (!groupResult.rows.length) {
             await client.query('ROLLBACK');
+            transactionStarted = false;
 
             return res.status(404).json({
                 error: 'Group not found.'
@@ -366,31 +391,15 @@ app.put('/api/groups/:id', async (req, res) => {
         }
 
         const group = groupResult.rows[0];
-        const admins = parseEmailList(group.admin_email);
-        const members = parseEmailList(group.members_email);
+        const admins = getGroupAdmins(group);
 
         if (!admins.includes(requesterEmail)) {
             await client.query('ROLLBACK');
+            transactionStarted = false;
 
             return res.status(403).json({
                 error: 'Only group admins can update this group.'
             });
-        }
-
-        if (promote_email) {
-            const promoteEmail = normalizeEmail(promote_email);
-
-            if (!members.includes(promoteEmail)) {
-                await client.query('ROLLBACK');
-
-                return res.status(400).json({
-                    error: 'The user must join the group before promotion.'
-                });
-            }
-
-            if (!admins.includes(promoteEmail)) {
-                admins.push(promoteEmail);
-            }
         }
 
         const updatedName = groupname !== undefined
@@ -399,6 +408,7 @@ app.put('/api/groups/:id', async (req, res) => {
 
         if (updatedName.length < 3 || updatedName.length > 80) {
             await client.query('ROLLBACK');
+            transactionStarted = false;
 
             return res.status(400).json({
                 error: 'Group name must be between 3 and 80 characters.'
@@ -417,6 +427,8 @@ app.put('/api/groups/:id', async (req, res) => {
             ? type
             : group.type;
 
+        // undefined = preserve old image
+        // null or '' = clear image
         const updatedAvatar = avatar !== undefined
             ? (avatar || null)
             : group.avatar;
@@ -432,9 +444,8 @@ app.put('/api/groups/:id', async (req, res) => {
                 short_discription = $3,
                 type = $4,
                 avatar = $5,
-                cover_photo = $6,
-                admin_email = $7::jsonb
-            WHERE id = $8
+                cover_photo = $6
+            WHERE id = $7
             RETURNING *;
         `, [
             updatedName,
@@ -443,37 +454,43 @@ app.put('/api/groups/:id', async (req, res) => {
             updatedType,
             updatedAvatar,
             updatedCover,
-            JSON.stringify(admins),
             req.params.id
         ]);
 
         await client.query('COMMIT');
+        transactionStarted = false;
 
         return res.json({
+            success: true,
             message: 'Group updated successfully!',
             group: result.rows[0]
         });
 
     } catch (error) {
-        await client.query('ROLLBACK');
+        if (client && transactionStarted) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
 
-        console.error('Update group error:', error.message);
+        console.error('Update group error:', error);
 
         return res.status(500).json({
             error: 'Server error while updating group.'
         });
+
     } finally {
-        client.release();
+        if (client) client.release();
     }
 });
 
 // ==================== 6. JOIN GROUP ====================
-// No group password is required.
 
 app.post('/api/groups/:id/join', async (req, res) => {
-    const client = await pool.connect();
+    let client;
+    let transactionStarted = false;
 
     try {
+        client = await pool.connect();
+
         const email = normalizeEmail(req.body.email);
 
         if (!email) {
@@ -483,6 +500,7 @@ app.post('/api/groups/:id/join', async (req, res) => {
         }
 
         await client.query('BEGIN');
+        transactionStarted = true;
 
         const groupResult = await client.query(
             'SELECT * FROM groups WHERE id = $1 FOR UPDATE',
@@ -491,6 +509,7 @@ app.post('/api/groups/:id/join', async (req, res) => {
 
         if (!groupResult.rows.length) {
             await client.query('ROLLBACK');
+            transactionStarted = false;
 
             return res.status(404).json({
                 error: 'Group not found.'
@@ -498,13 +517,15 @@ app.post('/api/groups/:id/join', async (req, res) => {
         }
 
         const group = groupResult.rows[0];
-        const members = parseEmailList(group.members_email);
+        const members = getGroupMembers(group);
+        const admins = getGroupAdmins(group);
 
-        if (members.includes(email)) {
+        if (members.includes(email) || admins.includes(email)) {
             await client.query('ROLLBACK');
+            transactionStarted = false;
 
             return res.status(409).json({
-                message: 'User is already a member of this group.'
+                error: 'User is already a member of this group.'
             });
         }
 
@@ -521,31 +542,39 @@ app.post('/api/groups/:id/join', async (req, res) => {
         ]);
 
         await client.query('COMMIT');
+        transactionStarted = false;
 
         return res.json({
+            success: true,
             message: 'Successfully joined the group!',
             group: result.rows[0]
         });
 
     } catch (error) {
-        await client.query('ROLLBACK');
+        if (client && transactionStarted) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
 
-        console.error('Join group error:', error.message);
+        console.error('Join group error:', error);
 
         return res.status(500).json({
             error: 'Server error while joining group.'
         });
+
     } finally {
-        client.release();
+        if (client) client.release();
     }
 });
 
 // ==================== 7. LEAVE GROUP ====================
 
 app.post('/api/groups/:id/leave', async (req, res) => {
-    const client = await pool.connect();
+    let client;
+    let transactionStarted = false;
 
     try {
+        client = await pool.connect();
+
         const email = normalizeEmail(req.body.email);
 
         if (!email) {
@@ -555,6 +584,7 @@ app.post('/api/groups/:id/leave', async (req, res) => {
         }
 
         await client.query('BEGIN');
+        transactionStarted = true;
 
         const groupResult = await client.query(
             'SELECT * FROM groups WHERE id = $1 FOR UPDATE',
@@ -563,6 +593,7 @@ app.post('/api/groups/:id/leave', async (req, res) => {
 
         if (!groupResult.rows.length) {
             await client.query('ROLLBACK');
+            transactionStarted = false;
 
             return res.status(404).json({
                 error: 'Group not found.'
@@ -571,27 +602,34 @@ app.post('/api/groups/:id/leave', async (req, res) => {
 
         const group = groupResult.rows[0];
 
-        let members = parseEmailList(group.members_email);
-        let admins = parseEmailList(group.admin_email);
+        const members = getGroupMembers(group);
+        const admins = getGroupAdmins(group);
 
         if (!members.includes(email) && !admins.includes(email)) {
             await client.query('ROLLBACK');
+            transactionStarted = false;
 
             return res.status(400).json({
                 error: 'User is not a member of this group.'
             });
         }
 
-        if (admins.includes(email) && admins.length === 1) {
+        if (admins.includes(email) && admins.length <= 1) {
             await client.query('ROLLBACK');
+            transactionStarted = false;
 
             return res.status(400).json({
                 error: 'The sole admin must promote another admin before leaving.'
             });
         }
 
-        members = members.filter(member => member !== email);
-        admins = admins.filter(admin => admin !== email);
+        const updatedMembers = members.filter(
+            member => member !== email
+        );
+
+        const updatedAdmins = admins.filter(
+            admin => admin !== email
+        );
 
         const result = await client.query(`
             UPDATE groups
@@ -600,37 +638,45 @@ app.post('/api/groups/:id/leave', async (req, res) => {
             WHERE id = $3
             RETURNING *;
         `, [
-            JSON.stringify(members),
-            JSON.stringify(admins),
+            JSON.stringify(updatedMembers),
+            JSON.stringify(updatedAdmins),
             req.params.id
         ]);
 
         await client.query('COMMIT');
+        transactionStarted = false;
 
         return res.json({
+            success: true,
             message: 'Successfully left the group.',
             group: result.rows[0]
         });
 
     } catch (error) {
-        await client.query('ROLLBACK');
+        if (client && transactionStarted) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
 
-        console.error('Leave group error:', error.message);
+        console.error('Leave group error:', error);
 
         return res.status(500).json({
             error: 'Server error while leaving group.'
         });
+
     } finally {
-        client.release();
+        if (client) client.release();
     }
 });
 
-// ==================== 8. DELETE GROUP (ADMIN ONLY) ====================
+// ==================== 8. DELETE GROUP ====================
 
 app.delete('/api/groups/:id', async (req, res) => {
-    const client = await pool.connect();
+    let client;
+    let transactionStarted = false;
 
     try {
+        client = await pool.connect();
+
         const email = normalizeEmail(req.body.email);
 
         if (!email) {
@@ -640,6 +686,7 @@ app.delete('/api/groups/:id', async (req, res) => {
         }
 
         await client.query('BEGIN');
+        transactionStarted = true;
 
         const groupResult = await client.query(
             'SELECT * FROM groups WHERE id = $1 FOR UPDATE',
@@ -648,17 +695,18 @@ app.delete('/api/groups/:id', async (req, res) => {
 
         if (!groupResult.rows.length) {
             await client.query('ROLLBACK');
+            transactionStarted = false;
 
             return res.status(404).json({
                 error: 'Group not found.'
             });
         }
 
-        const group = groupResult.rows[0];
-        const admins = parseEmailList(group.admin_email);
+        const admins = getGroupAdmins(groupResult.rows[0]);
 
         if (!admins.includes(email)) {
             await client.query('ROLLBACK');
+            transactionStarted = false;
 
             return res.status(403).json({
                 error: 'Only group admins can delete this group.'
@@ -671,41 +719,42 @@ app.delete('/api/groups/:id', async (req, res) => {
         );
 
         await client.query('COMMIT');
+        transactionStarted = false;
 
         return res.json({
+            success: true,
             message: 'Group deleted successfully.'
         });
 
     } catch (error) {
-        await client.query('ROLLBACK');
+        if (client && transactionStarted) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
 
-        console.error('Delete group error:', error.message);
+        console.error('Delete group error:', error);
 
         return res.status(500).json({
             error: 'Server error while deleting group.'
         });
+
     } finally {
-        client.release();
+        if (client) client.release();
     }
 });
 
-
-// =====================================================
- // PROMOTE GROUP MEMBER TO ADMIN
- // =====================================================
+// ==================== 9. PROMOTE MEMBER TO ADMIN ====================
 
 app.post('/api/groups/:id/promote-admin', async (req, res) => {
-    const client = await pool.connect();
-
+    let client;
     let transactionStarted = false;
 
     try {
+        client = await pool.connect();
+
         const groupId = req.params.id;
 
-        const { email, promote_email } = req.body;
-
-        const requesterEmail = String(email || '').trim().toLowerCase();
-        const promoteEmail = String(promote_email || '').trim().toLowerCase();
+        const requesterEmail = normalizeEmail(req.body.email);
+        const promoteEmail = normalizeEmail(req.body.promote_email);
 
         if (!requesterEmail || !promoteEmail) {
             return res.status(400).json({
@@ -724,11 +773,8 @@ app.post('/api/groups/:id/promote-admin', async (req, res) => {
         await client.query('BEGIN');
         transactionStarted = true;
 
-        // Fetch group with row lock
         const result = await client.query(
-            `SELECT * FROM groups
-             WHERE id = $1
-             FOR UPDATE`,
+            'SELECT * FROM groups WHERE id = $1 FOR UPDATE',
             [groupId]
         );
 
@@ -744,16 +790,9 @@ app.post('/api/groups/:id/promote-admin', async (req, res) => {
 
         const group = result.rows[0];
 
-        // Parse JSON / JSONB arrays
-        const admins = Array.isArray(group.admin_email)
-            ? group.admin_email.map(e => String(e).trim().toLowerCase())
-            : [];
+        const admins = getGroupAdmins(group);
+        const members = getGroupMembers(group);
 
-        const members = Array.isArray(group.members_email)
-            ? group.members_email.map(e => String(e).trim().toLowerCase())
-            : [];
-
-        // Check requester admin permission
         if (!admins.includes(requesterEmail)) {
             await client.query('ROLLBACK');
             transactionStarted = false;
@@ -764,7 +803,6 @@ app.post('/api/groups/:id/promote-admin', async (req, res) => {
             });
         }
 
-        // Check target membership
         if (!members.includes(promoteEmail)) {
             await client.query('ROLLBACK');
             transactionStarted = false;
@@ -775,7 +813,6 @@ app.post('/api/groups/:id/promote-admin', async (req, res) => {
             });
         }
 
-        // Already admin?
         if (admins.includes(promoteEmail)) {
             await client.query('ROLLBACK');
             transactionStarted = false;
@@ -786,45 +823,39 @@ app.post('/api/groups/:id/promote-admin', async (req, res) => {
             });
         }
 
-        // Add new admin
         const updatedAdmins = [
             ...admins,
             promoteEmail
         ];
 
-        // Remove from members
         const updatedMembers = members.filter(
-            e => e !== promoteEmail
+            email => email !== promoteEmail
         );
 
-        // Update database
-        // JSON.stringify supports both JSON and JSONB columns
-        const updateResult = await client.query(
-            `UPDATE groups
-             SET admin_email = $1,
-                 members_email = $2
-             WHERE id = $3
-             RETURNING *`,
-            [
-                JSON.stringify(updatedAdmins),
-                JSON.stringify(updatedMembers),
-                groupId
-            ]
-        );
+        const updateResult = await client.query(`
+            UPDATE groups
+            SET admin_email = $1::jsonb,
+                members_email = $2::jsonb
+            WHERE id = $3
+            RETURNING *;
+        `, [
+            JSON.stringify(updatedAdmins),
+            JSON.stringify(updatedMembers),
+            groupId
+        ]);
 
         await client.query('COMMIT');
         transactionStarted = false;
 
-        return res.status(200).json({
+        return res.json({
             success: true,
             message: 'Member successfully promoted to admin.',
             group: updateResult.rows[0]
         });
 
     } catch (error) {
-
-        if (transactionStarted) {
-            await client.query('ROLLBACK');
+        if (client && transactionStarted) {
+            await client.query('ROLLBACK').catch(() => {});
         }
 
         console.error('Promote admin error:', error);
@@ -835,26 +866,21 @@ app.post('/api/groups/:id/promote-admin', async (req, res) => {
         });
 
     } finally {
-        client.release();
+        if (client) client.release();
     }
 });
 
-
-// =====================================================
- // LEAVE GROUP ADMIN ROLE
- // =====================================================
+// ==================== 10. LEAVE ADMIN ROLE ====================
 
 app.post('/api/groups/:id/leave-admin', async (req, res) => {
-    const client = await pool.connect();
-
+    let client;
     let transactionStarted = false;
 
     try {
-        const groupId = req.params.id;
+        client = await pool.connect();
 
-        const requesterEmail = String(
-            req.body.email || ''
-        ).trim().toLowerCase();
+        const groupId = req.params.id;
+        const requesterEmail = normalizeEmail(req.body.email);
 
         if (!requesterEmail) {
             return res.status(400).json({
@@ -866,11 +892,8 @@ app.post('/api/groups/:id/leave-admin', async (req, res) => {
         await client.query('BEGIN');
         transactionStarted = true;
 
-        // Fetch group with row lock
         const result = await client.query(
-            `SELECT * FROM groups
-             WHERE id = $1
-             FOR UPDATE`,
+            'SELECT * FROM groups WHERE id = $1 FOR UPDATE',
             [groupId]
         );
 
@@ -886,16 +909,9 @@ app.post('/api/groups/:id/leave-admin', async (req, res) => {
 
         const group = result.rows[0];
 
-        // Parse JSON / JSONB arrays
-        const admins = Array.isArray(group.admin_email)
-            ? group.admin_email.map(e => String(e).trim().toLowerCase())
-            : [];
+        const admins = getGroupAdmins(group);
+        const members = getGroupMembers(group);
 
-        const members = Array.isArray(group.members_email)
-            ? group.members_email.map(e => String(e).trim().toLowerCase())
-            : [];
-
-        // Check admin permission
         if (!admins.includes(requesterEmail)) {
             await client.query('ROLLBACK');
             transactionStarted = false;
@@ -906,7 +922,6 @@ app.post('/api/groups/:id/leave-admin', async (req, res) => {
             });
         }
 
-        // Prevent last admin from leaving
         if (admins.length <= 1) {
             await client.query('ROLLBACK');
             transactionStarted = false;
@@ -917,44 +932,39 @@ app.post('/api/groups/:id/leave-admin', async (req, res) => {
             });
         }
 
-        // Remove requester from admins
         const updatedAdmins = admins.filter(
-            e => e !== requesterEmail
+            email => email !== requesterEmail
         );
 
-        // Return requester to members
         const updatedMembers = [
-            ...members.filter(e => e !== requesterEmail),
+            ...members.filter(email => email !== requesterEmail),
             requesterEmail
         ];
 
-        // Update database
-        const updateResult = await client.query(
-            `UPDATE groups
-             SET admin_email = $1,
-                 members_email = $2
-             WHERE id = $3
-             RETURNING *`,
-            [
-                JSON.stringify(updatedAdmins),
-                JSON.stringify(updatedMembers),
-                groupId
-            ]
-        );
+        const updateResult = await client.query(`
+            UPDATE groups
+            SET admin_email = $1::jsonb,
+                members_email = $2::jsonb
+            WHERE id = $3
+            RETURNING *;
+        `, [
+            JSON.stringify(updatedAdmins),
+            JSON.stringify(updatedMembers),
+            groupId
+        ]);
 
         await client.query('COMMIT');
         transactionStarted = false;
 
-        return res.status(200).json({
+        return res.json({
             success: true,
             message: 'You have successfully left the admin role.',
             group: updateResult.rows[0]
         });
 
     } catch (error) {
-
-        if (transactionStarted) {
-            await client.query('ROLLBACK');
+        if (client && transactionStarted) {
+            await client.query('ROLLBACK').catch(() => {});
         }
 
         console.error('Leave admin error:', error);
@@ -965,24 +975,42 @@ app.post('/api/groups/:id/leave-admin', async (req, res) => {
         });
 
     } finally {
-        client.release();
+        if (client) client.release();
     }
 });
 
+// ==================== SERVER ERROR HANDLER ====================
+
+app.use((error, req, res, next) => {
+    console.error('Express error:', error);
+
+    if (error.type === 'entity.too.large') {
+        return res.status(413).json({
+            error: 'Uploaded data is too large. Please use a smaller image.'
+        });
+    }
+
+    return res.status(500).json({
+        error: 'Internal server error.'
+    });
+});
 
 // ==================== START SERVER ====================
 
 const PORT = process.env.PORT || 5000;
 
 async function startServer() {
-    await setupDatabase();
+    try {
+        await setupDatabase();
 
-    app.listen(PORT, () => {
-        console.log(`AsirNet Group API running on port ${PORT}`);
-    });
+        app.listen(PORT, () => {
+            console.log(`AsirNet Group API running on port ${PORT}`);
+        });
+
+    } catch (error) {
+        console.error('Server startup failed:', error);
+        process.exit(1);
+    }
 }
 
-startServer().catch(error => {
-    console.error('Server startup failed:', error);
-    process.exit(1);
-});
+startServer();
