@@ -690,26 +690,27 @@ app.delete('/api/groups/:id', async (req, res) => {
 });
 
 
-
- // =====================================================
+// =====================================================
  // PROMOTE GROUP MEMBER TO ADMIN
  // =====================================================
 
 app.post('/api/groups/:id/promote-admin', async (req, res) => {
     const client = await pool.connect();
 
+    let transactionStarted = false;
+
     try {
         const groupId = req.params.id;
 
         const { email, promote_email } = req.body;
 
-        const requesterEmail = normalizeEmail(email);
-        const promoteEmail = normalizeEmail(promote_email);
+        const requesterEmail = String(email || '').trim().toLowerCase();
+        const promoteEmail = String(promote_email || '').trim().toLowerCase();
 
         if (!requesterEmail || !promoteEmail) {
             return res.status(400).json({
                 success: false,
-                message: 'Requester email and promote email are required.'
+                message: 'Both emails are required.'
             });
         }
 
@@ -721,17 +722,19 @@ app.post('/api/groups/:id/promote-admin', async (req, res) => {
         }
 
         await client.query('BEGIN');
+        transactionStarted = true;
 
-        // Get group and lock row
-        const groupResult = await client.query(
+        // Fetch group with row lock
+        const result = await client.query(
             `SELECT * FROM groups
              WHERE id = $1
              FOR UPDATE`,
             [groupId]
         );
 
-        if (!groupResult.rows.length) {
+        if (!result.rows.length) {
             await client.query('ROLLBACK');
+            transactionStarted = false;
 
             return res.status(404).json({
                 success: false,
@@ -739,19 +742,21 @@ app.post('/api/groups/:id/promote-admin', async (req, res) => {
             });
         }
 
-        const group = groupResult.rows[0];
+        const group = result.rows[0];
 
+        // Parse JSON / JSONB arrays
         const admins = Array.isArray(group.admin_email)
-            ? group.admin_email.map(normalizeEmail)
+            ? group.admin_email.map(e => String(e).trim().toLowerCase())
             : [];
 
         const members = Array.isArray(group.members_email)
-            ? group.members_email.map(normalizeEmail)
+            ? group.members_email.map(e => String(e).trim().toLowerCase())
             : [];
 
-        // Verify requester is admin
+        // Check requester admin permission
         if (!admins.includes(requesterEmail)) {
             await client.query('ROLLBACK');
+            transactionStarted = false;
 
             return res.status(403).json({
                 success: false,
@@ -759,37 +764,41 @@ app.post('/api/groups/:id/promote-admin', async (req, res) => {
             });
         }
 
-        // Verify target is a group member
+        // Check target membership
         if (!members.includes(promoteEmail)) {
             await client.query('ROLLBACK');
+            transactionStarted = false;
 
             return res.status(400).json({
                 success: false,
-                message: 'This user is not a member of this group.'
+                message: 'This user is not a group member.'
             });
         }
 
-        // Already an admin?
+        // Already admin?
         if (admins.includes(promoteEmail)) {
             await client.query('ROLLBACK');
+            transactionStarted = false;
 
             return res.status(409).json({
                 success: false,
-                message: 'This member is already an admin.'
+                message: 'This user is already an admin.'
             });
         }
 
-        // Promote member
+        // Add new admin
         const updatedAdmins = [
             ...admins,
             promoteEmail
         ];
 
-        // Remove promoted member from members list
+        // Remove from members
         const updatedMembers = members.filter(
-            member => member !== promoteEmail
+            e => e !== promoteEmail
         );
 
+        // Update database
+        // JSON.stringify supports both JSON and JSONB columns
         const updateResult = await client.query(
             `UPDATE groups
              SET admin_email = $1,
@@ -797,13 +806,14 @@ app.post('/api/groups/:id/promote-admin', async (req, res) => {
              WHERE id = $3
              RETURNING *`,
             [
-                updatedAdmins,
-                updatedMembers,
+                JSON.stringify(updatedAdmins),
+                JSON.stringify(updatedMembers),
                 groupId
             ]
         );
 
         await client.query('COMMIT');
+        transactionStarted = false;
 
         return res.status(200).json({
             success: true,
@@ -813,9 +823,141 @@ app.post('/api/groups/:id/promote-admin', async (req, res) => {
 
     } catch (error) {
 
-        await client.query('ROLLBACK');
+        if (transactionStarted) {
+            await client.query('ROLLBACK');
+        }
 
         console.error('Promote admin error:', error);
+
+        return res.status(500).json({
+            success: false,
+            message: 'Internal server error.'
+        });
+
+    } finally {
+        client.release();
+    }
+});
+
+
+// =====================================================
+ // LEAVE GROUP ADMIN ROLE
+ // =====================================================
+
+app.post('/api/groups/:id/leave-admin', async (req, res) => {
+    const client = await pool.connect();
+
+    let transactionStarted = false;
+
+    try {
+        const groupId = req.params.id;
+
+        const requesterEmail = String(
+            req.body.email || ''
+        ).trim().toLowerCase();
+
+        if (!requesterEmail) {
+            return res.status(400).json({
+                success: false,
+                message: 'Email is required.'
+            });
+        }
+
+        await client.query('BEGIN');
+        transactionStarted = true;
+
+        // Fetch group with row lock
+        const result = await client.query(
+            `SELECT * FROM groups
+             WHERE id = $1
+             FOR UPDATE`,
+            [groupId]
+        );
+
+        if (!result.rows.length) {
+            await client.query('ROLLBACK');
+            transactionStarted = false;
+
+            return res.status(404).json({
+                success: false,
+                message: 'Group not found.'
+            });
+        }
+
+        const group = result.rows[0];
+
+        // Parse JSON / JSONB arrays
+        const admins = Array.isArray(group.admin_email)
+            ? group.admin_email.map(e => String(e).trim().toLowerCase())
+            : [];
+
+        const members = Array.isArray(group.members_email)
+            ? group.members_email.map(e => String(e).trim().toLowerCase())
+            : [];
+
+        // Check admin permission
+        if (!admins.includes(requesterEmail)) {
+            await client.query('ROLLBACK');
+            transactionStarted = false;
+
+            return res.status(403).json({
+                success: false,
+                message: 'You are not an admin of this group.'
+            });
+        }
+
+        // Prevent last admin from leaving
+        if (admins.length <= 1) {
+            await client.query('ROLLBACK');
+            transactionStarted = false;
+
+            return res.status(400).json({
+                success: false,
+                message: 'You cannot leave because you are the only admin. Promote another member first.'
+            });
+        }
+
+        // Remove requester from admins
+        const updatedAdmins = admins.filter(
+            e => e !== requesterEmail
+        );
+
+        // Return requester to members
+        const updatedMembers = [
+            ...members.filter(e => e !== requesterEmail),
+            requesterEmail
+        ];
+
+        // Update database
+        const updateResult = await client.query(
+            `UPDATE groups
+             SET admin_email = $1,
+                 members_email = $2
+             WHERE id = $3
+             RETURNING *`,
+            [
+                JSON.stringify(updatedAdmins),
+                JSON.stringify(updatedMembers),
+                groupId
+            ]
+        );
+
+        await client.query('COMMIT');
+        transactionStarted = false;
+
+        return res.status(200).json({
+            success: true,
+            message: 'You have successfully left the admin role.',
+            group: updateResult.rows[0]
+        });
+
+    } catch (error) {
+
+        if (transactionStarted) {
+            await client.query('ROLLBACK');
+        }
+
+        console.error('Leave admin error:', error);
 
         return res.status(500).json({
             success: false,
